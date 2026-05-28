@@ -50,6 +50,9 @@ try:
     import concurrent.futures
     import matplotlib.pyplot as plt
     import seaborn as sns
+    import plotly.express as px
+    import plotly.graph_objects as go
+    import umap
     from doctr.models import ocr_predictor
     from doctr.io import Document as DoctrDocument
 
@@ -57,7 +60,7 @@ except ImportError as e:
     print(f"\n--- Dependency Error ---")
     print(f"Failed to import a required library: {e.name}")
     print("Please ensure all dependencies are installed. You can install them using:")
-    print("pip install \"doctr[torch]\" PyMuPDF scikit-learn scipy seaborn matplotlib tqdm")
+    print("pip install \"doctr[torch]\" PyMuPDF scikit-learn scipy seaborn matplotlib tqdm plotly umap-learn")
     sys.exit(1)
 
 
@@ -468,6 +471,89 @@ class DocumentFingerprinter:
         plt.close(fig)
         logging.info(f"Saved template comparison grid to: {output_path}")
 
+    def _generate_interactive_dashboard(self, all_doc_fingerprints: List[Optional[np.ndarray]], all_doc_texts: List[str], grouped_files: List[List[str]]) -> None:
+        """Generates an interactive Plotly dashboard for exploring the clusters."""
+        logging.info("Generating interactive HTML dashboard...")
+
+        valid_indices = []
+        valid_fps = []
+        hover_texts = []
+        cluster_labels = []
+
+        # Build lookup maps
+        file_to_cluster = {}
+        for cluster_id, files in enumerate(grouped_files):
+            # If HDBSCAN is used, the last group is noise if it matches conditions
+            is_noise = False
+            if self.config.clustering_engine == "hdbscan" and cluster_id == len(grouped_files) - 1:
+                is_noise = True
+
+            label_name = "Noise / Outliers" if is_noise else f"Template #{cluster_id + 1}"
+            for f in files:
+                file_to_cluster[f] = label_name
+
+        for i, fp in enumerate(all_doc_fingerprints):
+            if fp is not None and np.sum(fp) > 0:
+                valid_indices.append(i)
+                valid_fps.append(fp)
+                filename = os.path.basename(self.pdf_files[i])
+                text_snippet = all_doc_texts[i][:200] + "..." if len(all_doc_texts[i]) > 200 else all_doc_texts[i]
+                hover_texts.append(f"<b>File:</b> {filename}<br><b>Text Snippet:</b><br>{text_snippet}")
+                cluster_labels.append(file_to_cluster.get(filename, "Unknown"))
+
+        if len(valid_fps) < 3:
+            logging.warning("Not enough valid documents to generate UMAP visualization.")
+            return
+
+        # Use UMAP to reduce the high-dimensional fingerprints to 2D for scatter plotting
+        # Note: setting n_neighbors safely based on dataset size
+        n_neighbors = min(15, max(2, len(valid_fps) - 1))
+        reducer = umap.UMAP(n_neighbors=n_neighbors, min_dist=0.1, random_state=42)
+        embedding = reducer.fit_transform(np.array(valid_fps))
+
+        # Create Plotly figure
+        fig = px.scatter(
+            x=embedding[:, 0],
+            y=embedding[:, 1],
+            color=cluster_labels,
+            hover_name=hover_texts,
+            title="Document Cluster Visualization (UMAP)",
+            labels={'color': 'Cluster Group'}
+        )
+
+        # Generate Dynamic Insights
+        num_docs = len(valid_fps)
+        noise_docs = cluster_labels.count("Noise / Outliers")
+        noise_ratio = (noise_docs / num_docs) * 100 if num_docs > 0 else 0
+
+        insights_html = f"<h3>Analysis Insights</h3><ul>"
+        insights_html += f"<li><b>Total Documents Analyzed:</b> {num_docs}</li>"
+
+        if self.config.clustering_engine == "hdbscan":
+            insights_html += f"<li><b>Noise Ratio:</b> {noise_ratio:.1f}% ({noise_docs} outliers)</li>"
+            if noise_ratio > 15:
+                insights_html += "<li><span style='color:red;'><b>Recommendation:</b> Noise ratio is high (>15%). Consider increasing <code>--blur</code> to be more forgiving of layout shifts, or decrease <code>--min_cluster_size</code> to allow smaller identical groups to form instead of being marked as noise.</span></li>"
+            elif noise_ratio < 2:
+                insights_html += "<li><span style='color:green;'><b>Recommendation:</b> Noise ratio is very low. Clusters look well-defined. If templates are incorrectly merged, consider lowering <code>--blur</code> or increasing the <code>--semantic_weight</code>.</span></li>"
+        else:
+            insights_html += f"<li><b>Engine:</b> Agglomerative Clustering (Strict thresholding).</li>"
+            insights_html += "<li><span style='color:blue;'><b>Recommendation:</b> Agglomerative clustering does not flag noise. If you are seeing vastly different templates merged together, increase your <code>--threshold</code> closer to 1.0. If you are running massive batches, consider switching to <code>--engine hdbscan</code> to automatically isolate unique outlier forms.</span></li>"
+
+        insights_html += "</ul>"
+
+        # Write to HTML
+        output_path = os.path.join(self.config.output_dir, "interactive_dashboard.html")
+        with open(output_path, 'w', encoding='utf-8') as f:
+            f.write("<html><head><title>Layout Analyzer Dashboard</title>")
+            f.write("<style>body { font-family: sans-serif; margin: 20px; }</style></head><body>")
+            f.write("<h1>Document Layout Grouping Dashboard</h1>")
+            f.write(insights_html)
+            f.write("<hr>")
+            f.write(fig.to_html(full_html=False, include_plotlyjs='cdn'))
+            f.write("</body></html>")
+
+        logging.info(f"Saved interactive dashboard to: {output_path}")
+
     def _save_heatmap(self, fingerprint: Optional[np.ndarray], title: str, output_path: str) -> None:
         """Generates and saves a single heatmap from a flattened fingerprint."""
         if fingerprint is None or np.sum(fingerprint) == 0:
@@ -553,6 +639,7 @@ class DocumentFingerprinter:
 
         stage_time = time.monotonic()
         self._generate_visual_reports(grouped_files, unique_fps, all_doc_fingerprints)
+        self._generate_interactive_dashboard(all_doc_fingerprints, all_doc_texts, grouped_files)
         self.timings["5. Visual Report Generation"] = time.monotonic() - stage_time
         
         self.timings["Total Script Runtime"] = time.monotonic() - script_start_time
