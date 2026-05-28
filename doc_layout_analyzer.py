@@ -44,6 +44,8 @@ try:
     from PIL import Image
     from tqdm import tqdm
     from sklearn.metrics.pairwise import cosine_similarity
+    from sklearn.cluster import AgglomerativeClustering
+    import scipy.ndimage
     import concurrent.futures
     import matplotlib.pyplot as plt
     import seaborn as sns
@@ -54,7 +56,7 @@ except ImportError as e:
     print(f"\n--- Dependency Error ---")
     print(f"Failed to import a required library: {e.name}")
     print("Please ensure all dependencies are installed. You can install them using:")
-    print("pip install \"doctr[torch]\" PyMuPDF scikit-learn seaborn matplotlib tqdm")
+    print("pip install \"doctr[torch]\" PyMuPDF scikit-learn scipy seaborn matplotlib tqdm")
     sys.exit(1)
 
 
@@ -67,6 +69,7 @@ class Config:
     similarity_threshold: float = 0.9
     pages_to_process: int = 1
     grid_size: Tuple[int, int] = (10, 10)
+    blur_sigma: float = 1.0  # Controls the spread of the Gaussian blur
     max_workers: Optional[int] = None
     batch_size: int = 32
     comparison_grid_limit: int = 20
@@ -172,8 +175,8 @@ class DocumentFingerprinter:
         return relative_boxes
 
     @staticmethod
-    def _create_spatial_signature(relative_boxes: List[List[float]], grid_size: Tuple[int, int]) -> np.ndarray:
-        """Creates a flattened 2D histogram of word centroids."""
+    def _create_spatial_signature(relative_boxes: List[List[float]], grid_size: Tuple[int, int], blur_sigma: float) -> np.ndarray:
+        """Creates a flattened, blurred 2D histogram of word centroids."""
         rows, cols = grid_size
         signature = np.zeros((rows, cols), dtype=np.float32)
         if not relative_boxes:
@@ -185,7 +188,10 @@ class DocumentFingerprinter:
             col_idx = min(int(centroid_x * cols), cols - 1)
             row_idx = min(int(centroid_y * rows), rows - 1)
             signature[row_idx, col_idx] += 1
-        return signature.flatten()
+
+        # Apply Gaussian blur to spread the mass and make matching more robust
+        blurred_signature = scipy.ndimage.gaussian_filter(signature, sigma=blur_sigma)
+        return blurred_signature.flatten()
 
     def _preprocess_pdfs(self) -> Tuple[List[List[np.ndarray]], List[int]]:
         """
@@ -254,7 +260,7 @@ class DocumentFingerprinter:
             page_fingerprints = []
             for page_result in doc_ocr_pages:
                 relative_boxes = self._extract_relative_boxes(page_result)
-                page_fingerprints.append(self._create_spatial_signature(relative_boxes, self.config.grid_size))
+                page_fingerprints.append(self._create_spatial_signature(relative_boxes, self.config.grid_size, self.config.blur_sigma))
 
             # Sum fingerprints of all pages in a document to create a single doc fingerprint
             doc_fingerprint = np.sum(page_fingerprints, axis=0)
@@ -263,29 +269,65 @@ class DocumentFingerprinter:
         return all_doc_fingerprints
 
     def _group_documents(self, all_doc_fingerprints: List[Optional[np.ndarray]]) -> Tuple[List[np.ndarray], List[List[str]]]:
-        """Stage 4: Similarity Comparison and Grouping."""
+        """Stage 4: Similarity Comparison and Grouping (Clustering)."""
         logging.info("Fingerprinting complete. Grouping documents by similarity...")
-        unique_template_fingerprints: List[np.ndarray] = []
-        grouped_files: List[List[str]] = []
 
-        for i, current_fp in enumerate(tqdm(all_doc_fingerprints, desc="Grouping Documents")):
-            pdf_name = os.path.basename(self.pdf_files[i])
-            if current_fp is None or np.sum(current_fp) == 0:
+        # Filter out empty/invalid fingerprints and keep track of valid indices
+        valid_indices = []
+        valid_fps = []
+        for i, fp in enumerate(all_doc_fingerprints):
+            if fp is not None and np.sum(fp) > 0:
+                valid_indices.append(i)
+                valid_fps.append(fp)
+            else:
+                pdf_name = os.path.basename(self.pdf_files[i])
                 logging.warning(f"Skipping '{pdf_name}' due to empty or invalid fingerprint.")
-                continue
 
-            found_match = False
-            for j, existing_fp in enumerate(unique_template_fingerprints):
-                # Reshape for scikit-learn's cosine_similarity function
-                score = cosine_similarity(current_fp.reshape(1, -1), existing_fp.reshape(1, -1))[0][0]
-                if score > self.config.similarity_threshold:
-                    grouped_files[j].append(pdf_name)
-                    found_match = True
-                    break
+        if not valid_fps:
+            return [], []
 
-            if not found_match:
-                unique_template_fingerprints.append(current_fp)
-                grouped_files.append([pdf_name])
+        valid_fps_matrix = np.array(valid_fps)
+
+        # If there's only 1 valid document, just return it as a single group
+        if len(valid_fps) == 1:
+            return [valid_fps[0]], [[os.path.basename(self.pdf_files[valid_indices[0]])]]
+
+        # Compute pairwise distance matrix based on cosine similarity
+        # Cosine distance = 1 - cosine similarity
+        similarity_matrix = cosine_similarity(valid_fps_matrix)
+        # Ensure we don't get tiny negative values due to floating point inaccuracies
+        distance_matrix = np.clip(1.0 - similarity_matrix, 0.0, 2.0)
+
+        # Distance threshold is 1 - similarity threshold
+        distance_threshold = 1.0 - self.config.similarity_threshold
+
+        # Use Agglomerative Clustering
+        clustering = AgglomerativeClustering(
+            n_clusters=None,
+            metric="precomputed",
+            linkage="average", # Average linkage tends to form tighter clusters than single linkage
+            distance_threshold=distance_threshold
+        )
+
+        labels = clustering.fit_predict(distance_matrix)
+
+        # Reconstruct unique_template_fingerprints and grouped_files
+        num_clusters = len(set(labels))
+        unique_template_fingerprints = []
+        grouped_files = [[] for _ in range(num_clusters)]
+
+        for idx, label in enumerate(labels):
+            original_i = valid_indices[idx]
+            pdf_name = os.path.basename(self.pdf_files[original_i])
+            grouped_files[label].append(pdf_name)
+
+        # Calculate representative fingerprints for each cluster (e.g. mean)
+        for label in range(num_clusters):
+            # Get indices of valid_fps that belong to this cluster
+            cluster_indices = np.where(labels == label)[0]
+            cluster_fps = valid_fps_matrix[cluster_indices]
+            representative_fp = np.mean(cluster_fps, axis=0)
+            unique_template_fingerprints.append(representative_fp)
 
         return unique_template_fingerprints, grouped_files
 
@@ -470,10 +512,30 @@ def main():
                         help="Batch size for OCR processing on the GPU.")
     parser.add_argument("--dpi", type=int, default=96,
                         help="Dots Per Inch (DPI) to use when rendering PDF pages to images.")
+    parser.add_argument("--blur", type=float, default=1.0,
+                        help="Gaussian blur sigma for spatial fingerprints. Higher values allow more flexibility in layout matches.")
+    parser.add_argument("--profile", choices=["loss_runs", "applications", "default"], default="default",
+                        help="Select a pre-configured tuning profile for specific document types. Overrides --blur and --threshold.")
     # The --diag action is now handled manually above, but we keep it for --help message
     parser.add_argument("--diag", action="store_true", help="Run a diagnostic check and exit.")
 
     args = parser.parse_args()
+
+    # --- Profile Tuning Logic ---
+    threshold = args.threshold
+    blur = args.blur
+
+    if args.profile == "loss_runs":
+        threshold = 0.95
+        blur = 0.5
+        print("Using 'loss_runs' profile: Setting threshold=0.95, blur=0.5")
+    elif args.profile == "applications":
+        threshold = 0.85
+        blur = 1.5
+        print("Using 'applications' profile: Setting threshold=0.85, blur=1.5")
+    elif args.profile == "default":
+        # Do not override, use explicitly passed args or defaults
+        pass
 
     # --- Setup ---
     setup_logging("INFO")
@@ -483,10 +545,11 @@ def main():
     config = Config(
         pdf_folder_path=args.pdf_folder,
         output_dir=args.output_folder,
-        similarity_threshold=args.threshold,
+        similarity_threshold=threshold,
         pages_to_process=args.pages,
         batch_size=args.batch_size,
         dpi=args.dpi,
+        blur_sigma=blur,
     )
 
     # --- Execution ---
