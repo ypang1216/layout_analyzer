@@ -45,6 +45,7 @@ try:
     from tqdm import tqdm
     from sklearn.metrics.pairwise import cosine_similarity
     from sklearn.cluster import AgglomerativeClustering, HDBSCAN
+    from sklearn.feature_extraction.text import TfidfVectorizer
     import scipy.ndimage
     import concurrent.futures
     import matplotlib.pyplot as plt
@@ -72,6 +73,7 @@ class Config:
     blur_sigma: float = 1.0  # Controls the spread of the Gaussian blur
     clustering_engine: str = "agglomerative"
     min_cluster_size: int = 5 # Used for HDBSCAN
+    semantic_weight: float = 0.0 # Weight for text-based similarity
     max_workers: Optional[int] = None
     batch_size: int = 32
     comparison_grid_limit: int = 20
@@ -166,15 +168,17 @@ class DocumentFingerprinter:
         return pdf_files
 
     @staticmethod
-    def _extract_relative_boxes(page_result: Any) -> List[List[float]]:
-        """Extracts relative bounding box coordinates from a doctr Page result."""
+    def _extract_page_data(page_result: Any) -> Tuple[List[List[float]], str]:
+        """Extracts relative bounding box coordinates and raw text from a doctr Page result."""
         relative_boxes = []
+        text_content = []
         for block in page_result.blocks:
             for line in block.lines:
                 for word in line.words:
                     # word.geometry is ((x1, y1), (x2, y2))
                     relative_boxes.append([*word.geometry[0], *word.geometry[1]])
-        return relative_boxes
+                    text_content.append(word.value)
+        return relative_boxes, " ".join(text_content)
 
     @staticmethod
     def _create_spatial_signature(relative_boxes: List[List[float]], grid_size: Tuple[int, int], blur_sigma: float) -> np.ndarray:
@@ -246,41 +250,49 @@ class DocumentFingerprinter:
         return DoctrDocument(pages=all_pages_results)
 
 
-    def _generate_fingerprints(self, ocr_results: DoctrDocument, doc_page_counts: List[int]) -> List[Optional[np.ndarray]]:
-        """Stage 3: Fingerprint Generation (Fast CPU work)."""
-        logging.info("OCR complete. Generating fingerprints...")
+    def _generate_fingerprints(self, ocr_results: DoctrDocument, doc_page_counts: List[int]) -> Tuple[List[Optional[np.ndarray]], List[str]]:
+        """Stage 3: Fingerprint Generation & Text Extraction (Fast CPU work)."""
+        logging.info("OCR complete. Generating spatial fingerprints and extracting text...")
         all_doc_fingerprints = []
+        all_doc_texts = []
         current_pos = 0
 
         for page_count in tqdm(doc_page_counts, desc="Generating Fingerprints"):
             if page_count == 0:
                 all_doc_fingerprints.append(None)
+                all_doc_texts.append("")
                 continue
 
             doc_ocr_pages = ocr_results.pages[current_pos : current_pos + page_count]
             current_pos += page_count
             page_fingerprints = []
+            page_texts = []
+
             for page_result in doc_ocr_pages:
-                relative_boxes = self._extract_relative_boxes(page_result)
+                relative_boxes, text = self._extract_page_data(page_result)
                 page_fingerprints.append(self._create_spatial_signature(relative_boxes, self.config.grid_size, self.config.blur_sigma))
+                page_texts.append(text)
 
             # Sum fingerprints of all pages in a document to create a single doc fingerprint
             doc_fingerprint = np.sum(page_fingerprints, axis=0)
             all_doc_fingerprints.append(doc_fingerprint)
+            all_doc_texts.append(" ".join(page_texts))
 
-        return all_doc_fingerprints
+        return all_doc_fingerprints, all_doc_texts
 
-    def _group_documents(self, all_doc_fingerprints: List[Optional[np.ndarray]]) -> Tuple[List[np.ndarray], List[List[str]]]:
+    def _group_documents(self, all_doc_fingerprints: List[Optional[np.ndarray]], all_doc_texts: List[str]) -> Tuple[List[np.ndarray], List[List[str]]]:
         """Stage 4: Similarity Comparison and Grouping (Clustering)."""
         logging.info("Fingerprinting complete. Grouping documents by similarity...")
 
         # Filter out empty/invalid fingerprints and keep track of valid indices
         valid_indices = []
         valid_fps = []
+        valid_texts = []
         for i, fp in enumerate(all_doc_fingerprints):
             if fp is not None and np.sum(fp) > 0:
                 valid_indices.append(i)
                 valid_fps.append(fp)
+                valid_texts.append(all_doc_texts[i])
             else:
                 pdf_name = os.path.basename(self.pdf_files[i])
                 logging.warning(f"Skipping '{pdf_name}' due to empty or invalid fingerprint.")
@@ -294,11 +306,29 @@ class DocumentFingerprinter:
         if len(valid_fps) == 1:
             return [valid_fps[0]], [[os.path.basename(self.pdf_files[valid_indices[0]])]]
 
-        # Compute pairwise distance matrix based on cosine similarity
-        # Cosine distance = 1 - cosine similarity
-        similarity_matrix = cosine_similarity(valid_fps_matrix)
-        # Ensure we don't get tiny negative values due to floating point inaccuracies
-        distance_matrix = np.clip(1.0 - similarity_matrix, 0.0, 2.0)
+        # 1. Compute SPATIAL distance matrix
+        spatial_similarity_matrix = cosine_similarity(valid_fps_matrix)
+        spatial_distance_matrix = np.clip(1.0 - spatial_similarity_matrix, 0.0, 2.0)
+
+        # 2. Compute SEMANTIC distance matrix (if requested)
+        if self.config.semantic_weight > 0.0:
+            logging.info(f"Computing semantic distances (weight: {self.config.semantic_weight})")
+            try:
+                # min_df ignores unique fill-ins, ngram_range captures boilerplate phrases
+                vectorizer = TfidfVectorizer(min_df=0.05, max_df=1.0, ngram_range=(1, 3))
+                tfidf_matrix = vectorizer.fit_transform(valid_texts)
+                semantic_similarity_matrix = cosine_similarity(tfidf_matrix)
+                semantic_distance_matrix = np.clip(1.0 - semantic_similarity_matrix, 0.0, 2.0)
+
+                # Combine matrices via weighted average
+                spatial_weight = 1.0 - self.config.semantic_weight
+                distance_matrix = (spatial_weight * spatial_distance_matrix) + (self.config.semantic_weight * semantic_distance_matrix)
+            except ValueError as e:
+                # E.g., if vocabulary is empty because all words were filtered out
+                logging.warning(f"Semantic processing failed, falling back to spatial only. Reason: {e}")
+                distance_matrix = spatial_distance_matrix
+        else:
+            distance_matrix = spatial_distance_matrix
 
         if self.config.clustering_engine == "agglomerative":
             logging.info("Using Agglomerative Clustering engine.")
@@ -514,11 +544,11 @@ class DocumentFingerprinter:
         self.timings["2. OCR Processing (GPU/CPU)"] = time.monotonic() - stage_time
 
         stage_time = time.monotonic()
-        all_doc_fingerprints = self._generate_fingerprints(ocr_results, doc_page_counts)
-        self.timings["3. Fingerprint Generation"] = time.monotonic() - stage_time
+        all_doc_fingerprints, all_doc_texts = self._generate_fingerprints(ocr_results, doc_page_counts)
+        self.timings["3. Fingerprint & Text Ext."] = time.monotonic() - stage_time
 
         stage_time = time.monotonic()
-        unique_fps, grouped_files = self._group_documents(all_doc_fingerprints)
+        unique_fps, grouped_files = self._group_documents(all_doc_fingerprints, all_doc_texts)
         self.timings["4. Similarity Grouping"] = time.monotonic() - stage_time
 
         stage_time = time.monotonic()
@@ -560,6 +590,8 @@ def main():
                         help="Choose the clustering algorithm. 'agglomerative' uses a strict threshold. 'hdbscan' auto-finds dense clusters and isolates noise.")
     parser.add_argument("--min_cluster_size", type=int, default=5,
                         help="Minimum number of documents to form a cluster (only used if --engine is hdbscan).")
+    parser.add_argument("--semantic_weight", type=float, default=0.0,
+                        help="Weight (0.0 to 1.0) given to text content similarity vs spatial layout. 0.0 = purely spatial, 0.5 = 50/50 mix, 1.0 = purely semantic.")
     # The --diag action is now handled manually above, but we keep it for --help message
     parser.add_argument("--diag", action="store_true", help="Run a diagnostic check and exit.")
 
@@ -596,6 +628,7 @@ def main():
         blur_sigma=blur,
         clustering_engine=args.clustering_engine,
         min_cluster_size=args.min_cluster_size,
+        semantic_weight=args.semantic_weight,
     )
 
     # --- Execution ---
