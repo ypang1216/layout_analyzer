@@ -514,10 +514,28 @@ def main():
                         help="Dots Per Inch (DPI) to use when rendering PDF pages to images.")
     parser.add_argument("--blur", type=float, default=1.0,
                         help="Gaussian blur sigma for spatial fingerprints. Higher values allow more flexibility in layout matches.")
+    parser.add_argument("--profile", choices=["loss_runs", "applications", "default"], default="default",
+                        help="Select a pre-configured tuning profile for specific document types. Overrides --blur and --threshold.")
     # The --diag action is now handled manually above, but we keep it for --help message
     parser.add_argument("--diag", action="store_true", help="Run a diagnostic check and exit.")
 
     args = parser.parse_args()
+
+    # --- Profile Tuning Logic ---
+    threshold = args.threshold
+    blur = args.blur
+
+    if args.profile == "loss_runs":
+        threshold = 0.95
+        blur = 0.5
+        print("Using 'loss_runs' profile: Setting threshold=0.95, blur=0.5")
+    elif args.profile == "applications":
+        threshold = 0.85
+        blur = 1.5
+        print("Using 'applications' profile: Setting threshold=0.85, blur=1.5")
+    elif args.profile == "default":
+        # Do not override, use explicitly passed args or defaults
+        pass
 
     # --- Setup ---
     setup_logging("INFO")
@@ -527,11 +545,11 @@ def main():
     config = Config(
         pdf_folder_path=args.pdf_folder,
         output_dir=args.output_folder,
-        similarity_threshold=args.threshold,
+        similarity_threshold=threshold,
         pages_to_process=args.pages,
         batch_size=args.batch_size,
         dpi=args.dpi,
-        blur_sigma=args.blur,
+        blur_sigma=blur,
     )
 
     # --- Execution ---
