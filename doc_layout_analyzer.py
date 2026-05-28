@@ -44,7 +44,7 @@ try:
     from PIL import Image
     from tqdm import tqdm
     from sklearn.metrics.pairwise import cosine_similarity
-    from sklearn.cluster import AgglomerativeClustering
+    from sklearn.cluster import AgglomerativeClustering, HDBSCAN
     import scipy.ndimage
     import concurrent.futures
     import matplotlib.pyplot as plt
@@ -70,6 +70,8 @@ class Config:
     pages_to_process: int = 1
     grid_size: Tuple[int, int] = (10, 10)
     blur_sigma: float = 1.0  # Controls the spread of the Gaussian blur
+    clustering_engine: str = "agglomerative"
+    min_cluster_size: int = 5 # Used for HDBSCAN
     max_workers: Optional[int] = None
     batch_size: int = 32
     comparison_grid_limit: int = 20
@@ -298,36 +300,61 @@ class DocumentFingerprinter:
         # Ensure we don't get tiny negative values due to floating point inaccuracies
         distance_matrix = np.clip(1.0 - similarity_matrix, 0.0, 2.0)
 
-        # Distance threshold is 1 - similarity threshold
-        distance_threshold = 1.0 - self.config.similarity_threshold
+        if self.config.clustering_engine == "agglomerative":
+            logging.info("Using Agglomerative Clustering engine.")
+            distance_threshold = 1.0 - self.config.similarity_threshold
+            clustering = AgglomerativeClustering(
+                n_clusters=None,
+                metric="precomputed",
+                linkage="average",
+                distance_threshold=distance_threshold
+            )
+            labels = clustering.fit_predict(distance_matrix)
+        elif self.config.clustering_engine == "hdbscan":
+            logging.info("Using HDBSCAN Clustering engine.")
+            clustering = HDBSCAN(
+                min_cluster_size=self.config.min_cluster_size,
+                metric="precomputed",
+                cluster_selection_epsilon=1.0 - self.config.similarity_threshold # Optional: allow merging closer clusters
+            )
+            labels = clustering.fit_predict(distance_matrix)
+        else:
+            raise ValueError(f"Unknown clustering engine: {self.config.clustering_engine}")
 
-        # Use Agglomerative Clustering
-        clustering = AgglomerativeClustering(
-            n_clusters=None,
-            metric="precomputed",
-            linkage="average", # Average linkage tends to form tighter clusters than single linkage
-            distance_threshold=distance_threshold
-        )
+        # Determine the number of valid clusters (excluding noise, which is -1 in HDBSCAN)
+        unique_labels = set(labels)
+        has_noise = -1 in unique_labels
+        num_clusters = len(unique_labels) - (1 if has_noise else 0)
 
-        labels = clustering.fit_predict(distance_matrix)
-
-        # Reconstruct unique_template_fingerprints and grouped_files
-        num_clusters = len(set(labels))
         unique_template_fingerprints = []
+        # Initialize groups. If there's noise, we'll append a special 'Noise' group at the end
         grouped_files = [[] for _ in range(num_clusters)]
+        noise_files = []
 
         for idx, label in enumerate(labels):
             original_i = valid_indices[idx]
             pdf_name = os.path.basename(self.pdf_files[original_i])
-            grouped_files[label].append(pdf_name)
 
-        # Calculate representative fingerprints for each cluster (e.g. mean)
+            if label == -1:
+                noise_files.append(pdf_name)
+            else:
+                grouped_files[label].append(pdf_name)
+
+        # Calculate representative fingerprints for each valid cluster (e.g. mean)
         for label in range(num_clusters):
             # Get indices of valid_fps that belong to this cluster
             cluster_indices = np.where(labels == label)[0]
             cluster_fps = valid_fps_matrix[cluster_indices]
             representative_fp = np.mean(cluster_fps, axis=0)
             unique_template_fingerprints.append(representative_fp)
+
+        if noise_files:
+            logging.info(f"HDBSCAN marked {len(noise_files)} documents as noise/outliers.")
+            # We don't generate a single representative fingerprint for noise since they are diverse
+            # but we can append them to the grouped files for reporting
+            grouped_files.append(noise_files)
+            # Add a zero fingerprint for noise so lists remain aligned, though we might skip it in visualization
+            unique_template_fingerprints.append(np.zeros_like(valid_fps_matrix[0]))
 
         return unique_template_fingerprints, grouped_files
 
@@ -448,8 +475,13 @@ class DocumentFingerprinter:
             print(f"Found {len(grouped_files)} unique document templates.")
             print(f"✅ Visual validation reports saved to: '{self.config.output_dir}'\n")
 
-            sorted_groups = sorted(grouped_files, key=len, reverse=True)
-            for i, files in enumerate(sorted_groups):
+            # Sort groups by size, but keep the 'Noise' group (if it exists) at the very end
+            valid_groups = [g for g in grouped_files if self.config.clustering_engine != "hdbscan" or grouped_files.index(g) != len(grouped_files) - 1 or len(unique_template_fingerprints) == 0 or np.sum(unique_template_fingerprints[-1]) != 0]
+            noise_group = grouped_files[-1] if self.config.clustering_engine == "hdbscan" and grouped_files and np.sum(unique_template_fingerprints[-1]) == 0 else []
+
+            sorted_valid_groups = sorted(valid_groups, key=len, reverse=True)
+
+            for i, files in enumerate(sorted_valid_groups):
                 print(f"📄 Template #{i + 1} ({len(files)} files):")
                 print(f"   - {files[0]} (Representative)")
                 # Print up to 5 similar files for brevity
@@ -457,6 +489,14 @@ class DocumentFingerprinter:
                     print(f"   - {file_name}")
                 if len(files) > 6:
                     print(f"   ... and {len(files) - 6} more.")
+                print("-" * 25)
+
+            if noise_group:
+                print(f"⚠️  Noise / Outliers ({len(noise_group)} files):")
+                for file_name in sorted(noise_group[:5]):
+                    print(f"   - {file_name}")
+                if len(noise_group) > 5:
+                    print(f"   ... and {len(noise_group) - 5} more.")
                 print("-" * 25)
 
     def run(self) -> None:
@@ -516,6 +556,10 @@ def main():
                         help="Gaussian blur sigma for spatial fingerprints. Higher values allow more flexibility in layout matches.")
     parser.add_argument("--profile", choices=["loss_runs", "applications", "default"], default="default",
                         help="Select a pre-configured tuning profile for specific document types. Overrides --blur and --threshold.")
+    parser.add_argument("--engine", choices=["agglomerative", "hdbscan"], default="agglomerative", dest="clustering_engine",
+                        help="Choose the clustering algorithm. 'agglomerative' uses a strict threshold. 'hdbscan' auto-finds dense clusters and isolates noise.")
+    parser.add_argument("--min_cluster_size", type=int, default=5,
+                        help="Minimum number of documents to form a cluster (only used if --engine is hdbscan).")
     # The --diag action is now handled manually above, but we keep it for --help message
     parser.add_argument("--diag", action="store_true", help="Run a diagnostic check and exit.")
 
@@ -550,6 +594,8 @@ def main():
         batch_size=args.batch_size,
         dpi=args.dpi,
         blur_sigma=blur,
+        clustering_engine=args.clustering_engine,
+        min_cluster_size=args.min_cluster_size,
     )
 
     # --- Execution ---
