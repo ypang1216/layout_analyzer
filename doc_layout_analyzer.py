@@ -309,6 +309,10 @@ class DocumentFingerprinter:
         if len(valid_fps) == 1:
             return [valid_fps[0]], [[os.path.basename(self.pdf_files[valid_indices[0]])]]
 
+        num_docs = len(valid_fps)
+        if num_docs > 10000:
+            logging.warning(f"Processing {num_docs} documents. Computing N x N dense matrices may consume significant memory and could cause Out Of Memory (OOM) errors.")
+
         # 1. Compute SPATIAL distance matrix
         spatial_similarity_matrix = cosine_similarity(valid_fps_matrix)
         spatial_distance_matrix = np.clip(1.0 - spatial_similarity_matrix, 0.0, 2.0)
@@ -471,7 +475,7 @@ class DocumentFingerprinter:
         plt.close(fig)
         logging.info(f"Saved template comparison grid to: {output_path}")
 
-    def _generate_interactive_dashboard(self, all_doc_fingerprints: List[Optional[np.ndarray]], all_doc_texts: List[str], grouped_files: List[List[str]]) -> None:
+    def _generate_interactive_dashboard(self, all_doc_fingerprints: List[Optional[np.ndarray]], all_doc_texts: List[str], grouped_files: List[List[str]], unique_template_fps: List[np.ndarray]) -> None:
         """Generates an interactive Plotly dashboard for exploring the clusters."""
         logging.info("Generating interactive HTML dashboard...")
 
@@ -483,10 +487,11 @@ class DocumentFingerprinter:
         # Build lookup maps
         file_to_cluster = {}
         for cluster_id, files in enumerate(grouped_files):
-            # If HDBSCAN is used, the last group is noise if it matches conditions
+            # If HDBSCAN is used, the last group is noise ONLY IF it was marked as such (zeros fingerprint)
             is_noise = False
             if self.config.clustering_engine == "hdbscan" and cluster_id == len(grouped_files) - 1:
-                is_noise = True
+                if len(unique_template_fps) > cluster_id and np.sum(unique_template_fps[cluster_id]) == 0:
+                    is_noise = True
 
             label_name = "Noise / Outliers" if is_noise else f"Template #{cluster_id + 1}"
             for f in files:
@@ -639,7 +644,7 @@ class DocumentFingerprinter:
 
         stage_time = time.monotonic()
         self._generate_visual_reports(grouped_files, unique_fps, all_doc_fingerprints)
-        self._generate_interactive_dashboard(all_doc_fingerprints, all_doc_texts, grouped_files)
+        self._generate_interactive_dashboard(all_doc_fingerprints, all_doc_texts, grouped_files, unique_fps)
         self.timings["5. Visual Report Generation"] = time.monotonic() - stage_time
         
         self.timings["Total Script Runtime"] = time.monotonic() - script_start_time
