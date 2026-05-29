@@ -44,11 +44,15 @@ try:
     from PIL import Image
     from tqdm import tqdm
     from sklearn.metrics.pairwise import cosine_similarity
-    from sklearn.cluster import AgglomerativeClustering
+    from sklearn.cluster import AgglomerativeClustering, HDBSCAN
+    from sklearn.feature_extraction.text import TfidfVectorizer
     import scipy.ndimage
     import concurrent.futures
     import matplotlib.pyplot as plt
     import seaborn as sns
+    import plotly.express as px
+    import plotly.graph_objects as go
+    import umap
     from doctr.models import ocr_predictor
     from doctr.io import Document as DoctrDocument
 
@@ -56,7 +60,7 @@ except ImportError as e:
     print(f"\n--- Dependency Error ---")
     print(f"Failed to import a required library: {e.name}")
     print("Please ensure all dependencies are installed. You can install them using:")
-    print("pip install \"doctr[torch]\" PyMuPDF scikit-learn scipy seaborn matplotlib tqdm")
+    print("pip install \"doctr[torch]\" PyMuPDF scikit-learn scipy seaborn matplotlib tqdm plotly umap-learn")
     sys.exit(1)
 
 
@@ -70,6 +74,9 @@ class Config:
     pages_to_process: int = 1
     grid_size: Tuple[int, int] = (10, 10)
     blur_sigma: float = 1.0  # Controls the spread of the Gaussian blur
+    clustering_engine: str = "agglomerative"
+    min_cluster_size: int = 5 # Used for HDBSCAN
+    semantic_weight: float = 0.0 # Weight for text-based similarity
     max_workers: Optional[int] = None
     batch_size: int = 32
     comparison_grid_limit: int = 20
@@ -164,15 +171,17 @@ class DocumentFingerprinter:
         return pdf_files
 
     @staticmethod
-    def _extract_relative_boxes(page_result: Any) -> List[List[float]]:
-        """Extracts relative bounding box coordinates from a doctr Page result."""
+    def _extract_page_data(page_result: Any) -> Tuple[List[List[float]], str]:
+        """Extracts relative bounding box coordinates and raw text from a doctr Page result."""
         relative_boxes = []
+        text_content = []
         for block in page_result.blocks:
             for line in block.lines:
                 for word in line.words:
                     # word.geometry is ((x1, y1), (x2, y2))
                     relative_boxes.append([*word.geometry[0], *word.geometry[1]])
-        return relative_boxes
+                    text_content.append(word.value)
+        return relative_boxes, " ".join(text_content)
 
     @staticmethod
     def _create_spatial_signature(relative_boxes: List[List[float]], grid_size: Tuple[int, int], blur_sigma: float) -> np.ndarray:
@@ -244,41 +253,49 @@ class DocumentFingerprinter:
         return DoctrDocument(pages=all_pages_results)
 
 
-    def _generate_fingerprints(self, ocr_results: DoctrDocument, doc_page_counts: List[int]) -> List[Optional[np.ndarray]]:
-        """Stage 3: Fingerprint Generation (Fast CPU work)."""
-        logging.info("OCR complete. Generating fingerprints...")
+    def _generate_fingerprints(self, ocr_results: DoctrDocument, doc_page_counts: List[int]) -> Tuple[List[Optional[np.ndarray]], List[str]]:
+        """Stage 3: Fingerprint Generation & Text Extraction (Fast CPU work)."""
+        logging.info("OCR complete. Generating spatial fingerprints and extracting text...")
         all_doc_fingerprints = []
+        all_doc_texts = []
         current_pos = 0
 
         for page_count in tqdm(doc_page_counts, desc="Generating Fingerprints"):
             if page_count == 0:
                 all_doc_fingerprints.append(None)
+                all_doc_texts.append("")
                 continue
 
             doc_ocr_pages = ocr_results.pages[current_pos : current_pos + page_count]
             current_pos += page_count
             page_fingerprints = []
+            page_texts = []
+
             for page_result in doc_ocr_pages:
-                relative_boxes = self._extract_relative_boxes(page_result)
+                relative_boxes, text = self._extract_page_data(page_result)
                 page_fingerprints.append(self._create_spatial_signature(relative_boxes, self.config.grid_size, self.config.blur_sigma))
+                page_texts.append(text)
 
             # Sum fingerprints of all pages in a document to create a single doc fingerprint
             doc_fingerprint = np.sum(page_fingerprints, axis=0)
             all_doc_fingerprints.append(doc_fingerprint)
+            all_doc_texts.append(" ".join(page_texts))
 
-        return all_doc_fingerprints
+        return all_doc_fingerprints, all_doc_texts
 
-    def _group_documents(self, all_doc_fingerprints: List[Optional[np.ndarray]]) -> Tuple[List[np.ndarray], List[List[str]]]:
+    def _group_documents(self, all_doc_fingerprints: List[Optional[np.ndarray]], all_doc_texts: List[str]) -> Tuple[List[np.ndarray], List[List[str]]]:
         """Stage 4: Similarity Comparison and Grouping (Clustering)."""
         logging.info("Fingerprinting complete. Grouping documents by similarity...")
 
         # Filter out empty/invalid fingerprints and keep track of valid indices
         valid_indices = []
         valid_fps = []
+        valid_texts = []
         for i, fp in enumerate(all_doc_fingerprints):
             if fp is not None and np.sum(fp) > 0:
                 valid_indices.append(i)
                 valid_fps.append(fp)
+                valid_texts.append(all_doc_texts[i])
             else:
                 pdf_name = os.path.basename(self.pdf_files[i])
                 logging.warning(f"Skipping '{pdf_name}' due to empty or invalid fingerprint.")
@@ -292,42 +309,89 @@ class DocumentFingerprinter:
         if len(valid_fps) == 1:
             return [valid_fps[0]], [[os.path.basename(self.pdf_files[valid_indices[0]])]]
 
-        # Compute pairwise distance matrix based on cosine similarity
-        # Cosine distance = 1 - cosine similarity
-        similarity_matrix = cosine_similarity(valid_fps_matrix)
-        # Ensure we don't get tiny negative values due to floating point inaccuracies
-        distance_matrix = np.clip(1.0 - similarity_matrix, 0.0, 2.0)
+        num_docs = len(valid_fps)
+        if num_docs > 10000:
+            logging.warning(f"Processing {num_docs} documents. Computing N x N dense matrices may consume significant memory and could cause Out Of Memory (OOM) errors.")
 
-        # Distance threshold is 1 - similarity threshold
-        distance_threshold = 1.0 - self.config.similarity_threshold
+        # 1. Compute SPATIAL distance matrix
+        spatial_similarity_matrix = cosine_similarity(valid_fps_matrix)
+        spatial_distance_matrix = np.clip(1.0 - spatial_similarity_matrix, 0.0, 2.0)
 
-        # Use Agglomerative Clustering
-        clustering = AgglomerativeClustering(
-            n_clusters=None,
-            metric="precomputed",
-            linkage="average", # Average linkage tends to form tighter clusters than single linkage
-            distance_threshold=distance_threshold
-        )
+        # 2. Compute SEMANTIC distance matrix (if requested)
+        if self.config.semantic_weight > 0.0:
+            logging.info(f"Computing semantic distances (weight: {self.config.semantic_weight})")
+            try:
+                # min_df ignores unique fill-ins, ngram_range captures boilerplate phrases
+                vectorizer = TfidfVectorizer(min_df=0.05, max_df=1.0, ngram_range=(1, 3))
+                tfidf_matrix = vectorizer.fit_transform(valid_texts)
+                semantic_similarity_matrix = cosine_similarity(tfidf_matrix)
+                semantic_distance_matrix = np.clip(1.0 - semantic_similarity_matrix, 0.0, 2.0)
 
-        labels = clustering.fit_predict(distance_matrix)
+                # Combine matrices via weighted average
+                spatial_weight = 1.0 - self.config.semantic_weight
+                distance_matrix = (spatial_weight * spatial_distance_matrix) + (self.config.semantic_weight * semantic_distance_matrix)
+            except ValueError as e:
+                # E.g., if vocabulary is empty because all words were filtered out
+                logging.warning(f"Semantic processing failed, falling back to spatial only. Reason: {e}")
+                distance_matrix = spatial_distance_matrix
+        else:
+            distance_matrix = spatial_distance_matrix
 
-        # Reconstruct unique_template_fingerprints and grouped_files
-        num_clusters = len(set(labels))
+        if self.config.clustering_engine == "agglomerative":
+            logging.info("Using Agglomerative Clustering engine.")
+            distance_threshold = 1.0 - self.config.similarity_threshold
+            clustering = AgglomerativeClustering(
+                n_clusters=None,
+                metric="precomputed",
+                linkage="average",
+                distance_threshold=distance_threshold
+            )
+            labels = clustering.fit_predict(distance_matrix)
+        elif self.config.clustering_engine == "hdbscan":
+            logging.info("Using HDBSCAN Clustering engine.")
+            clustering = HDBSCAN(
+                min_cluster_size=self.config.min_cluster_size,
+                metric="precomputed",
+                cluster_selection_epsilon=1.0 - self.config.similarity_threshold # Optional: allow merging closer clusters
+            )
+            labels = clustering.fit_predict(distance_matrix)
+        else:
+            raise ValueError(f"Unknown clustering engine: {self.config.clustering_engine}")
+
+        # Determine the number of valid clusters (excluding noise, which is -1 in HDBSCAN)
+        unique_labels = set(labels)
+        has_noise = -1 in unique_labels
+        num_clusters = len(unique_labels) - (1 if has_noise else 0)
+
         unique_template_fingerprints = []
+        # Initialize groups. If there's noise, we'll append a special 'Noise' group at the end
         grouped_files = [[] for _ in range(num_clusters)]
+        noise_files = []
 
         for idx, label in enumerate(labels):
             original_i = valid_indices[idx]
             pdf_name = os.path.basename(self.pdf_files[original_i])
-            grouped_files[label].append(pdf_name)
 
-        # Calculate representative fingerprints for each cluster (e.g. mean)
+            if label == -1:
+                noise_files.append(pdf_name)
+            else:
+                grouped_files[label].append(pdf_name)
+
+        # Calculate representative fingerprints for each valid cluster (e.g. mean)
         for label in range(num_clusters):
             # Get indices of valid_fps that belong to this cluster
             cluster_indices = np.where(labels == label)[0]
             cluster_fps = valid_fps_matrix[cluster_indices]
             representative_fp = np.mean(cluster_fps, axis=0)
             unique_template_fingerprints.append(representative_fp)
+
+        if noise_files:
+            logging.info(f"HDBSCAN marked {len(noise_files)} documents as noise/outliers.")
+            # We don't generate a single representative fingerprint for noise since they are diverse
+            # but we can append them to the grouped files for reporting
+            grouped_files.append(noise_files)
+            # Add a zero fingerprint for noise so lists remain aligned, though we might skip it in visualization
+            unique_template_fingerprints.append(np.zeros_like(valid_fps_matrix[0]))
 
         return unique_template_fingerprints, grouped_files
 
@@ -411,6 +475,90 @@ class DocumentFingerprinter:
         plt.close(fig)
         logging.info(f"Saved template comparison grid to: {output_path}")
 
+    def _generate_interactive_dashboard(self, all_doc_fingerprints: List[Optional[np.ndarray]], all_doc_texts: List[str], grouped_files: List[List[str]], unique_template_fps: List[np.ndarray]) -> None:
+        """Generates an interactive Plotly dashboard for exploring the clusters."""
+        logging.info("Generating interactive HTML dashboard...")
+
+        valid_indices = []
+        valid_fps = []
+        hover_texts = []
+        cluster_labels = []
+
+        # Build lookup maps
+        file_to_cluster = {}
+        for cluster_id, files in enumerate(grouped_files):
+            # If HDBSCAN is used, the last group is noise ONLY IF it was marked as such (zeros fingerprint)
+            is_noise = False
+            if self.config.clustering_engine == "hdbscan" and cluster_id == len(grouped_files) - 1:
+                if len(unique_template_fps) > cluster_id and np.sum(unique_template_fps[cluster_id]) == 0:
+                    is_noise = True
+
+            label_name = "Noise / Outliers" if is_noise else f"Template #{cluster_id + 1}"
+            for f in files:
+                file_to_cluster[f] = label_name
+
+        for i, fp in enumerate(all_doc_fingerprints):
+            if fp is not None and np.sum(fp) > 0:
+                valid_indices.append(i)
+                valid_fps.append(fp)
+                filename = os.path.basename(self.pdf_files[i])
+                text_snippet = all_doc_texts[i][:200] + "..." if len(all_doc_texts[i]) > 200 else all_doc_texts[i]
+                hover_texts.append(f"<b>File:</b> {filename}<br><b>Text Snippet:</b><br>{text_snippet}")
+                cluster_labels.append(file_to_cluster.get(filename, "Unknown"))
+
+        if len(valid_fps) < 3:
+            logging.warning("Not enough valid documents to generate UMAP visualization.")
+            return
+
+        # Use UMAP to reduce the high-dimensional fingerprints to 2D for scatter plotting
+        # Note: setting n_neighbors safely based on dataset size
+        n_neighbors = min(15, max(2, len(valid_fps) - 1))
+        reducer = umap.UMAP(n_neighbors=n_neighbors, min_dist=0.1, random_state=42)
+        embedding = reducer.fit_transform(np.array(valid_fps))
+
+        # Create Plotly figure
+        fig = px.scatter(
+            x=embedding[:, 0],
+            y=embedding[:, 1],
+            color=cluster_labels,
+            hover_name=hover_texts,
+            title="Document Cluster Visualization (UMAP)",
+            labels={'color': 'Cluster Group'}
+        )
+
+        # Generate Dynamic Insights
+        num_docs = len(valid_fps)
+        noise_docs = cluster_labels.count("Noise / Outliers")
+        noise_ratio = (noise_docs / num_docs) * 100 if num_docs > 0 else 0
+
+        insights_html = f"<h3>Analysis Insights</h3><ul>"
+        insights_html += f"<li><b>Total Documents Analyzed:</b> {num_docs}</li>"
+
+        if self.config.clustering_engine == "hdbscan":
+            insights_html += f"<li><b>Noise Ratio:</b> {noise_ratio:.1f}% ({noise_docs} outliers)</li>"
+            if noise_ratio > 15:
+                insights_html += "<li><span style='color:red;'><b>Recommendation:</b> Noise ratio is high (>15%). Consider increasing <code>--blur</code> to be more forgiving of layout shifts, or decrease <code>--min_cluster_size</code> to allow smaller identical groups to form instead of being marked as noise.</span></li>"
+            elif noise_ratio < 2:
+                insights_html += "<li><span style='color:green;'><b>Recommendation:</b> Noise ratio is very low. Clusters look well-defined. If templates are incorrectly merged, consider lowering <code>--blur</code> or increasing the <code>--semantic_weight</code>.</span></li>"
+        else:
+            insights_html += f"<li><b>Engine:</b> Agglomerative Clustering (Strict thresholding).</li>"
+            insights_html += "<li><span style='color:blue;'><b>Recommendation:</b> Agglomerative clustering does not flag noise. If you are seeing vastly different templates merged together, increase your <code>--threshold</code> closer to 1.0. If you are running massive batches, consider switching to <code>--engine hdbscan</code> to automatically isolate unique outlier forms.</span></li>"
+
+        insights_html += "</ul>"
+
+        # Write to HTML
+        output_path = os.path.join(self.config.output_dir, "interactive_dashboard.html")
+        with open(output_path, 'w', encoding='utf-8') as f:
+            f.write("<html><head><title>Layout Analyzer Dashboard</title>")
+            f.write("<style>body { font-family: sans-serif; margin: 20px; }</style></head><body>")
+            f.write("<h1>Document Layout Grouping Dashboard</h1>")
+            f.write(insights_html)
+            f.write("<hr>")
+            f.write(fig.to_html(full_html=False, include_plotlyjs='cdn'))
+            f.write("</body></html>")
+
+        logging.info(f"Saved interactive dashboard to: {output_path}")
+
     def _save_heatmap(self, fingerprint: Optional[np.ndarray], title: str, output_path: str) -> None:
         """Generates and saves a single heatmap from a flattened fingerprint."""
         if fingerprint is None or np.sum(fingerprint) == 0:
@@ -448,8 +596,13 @@ class DocumentFingerprinter:
             print(f"Found {len(grouped_files)} unique document templates.")
             print(f"✅ Visual validation reports saved to: '{self.config.output_dir}'\n")
 
-            sorted_groups = sorted(grouped_files, key=len, reverse=True)
-            for i, files in enumerate(sorted_groups):
+            # Sort groups by size, but keep the 'Noise' group (if it exists) at the very end
+            valid_groups = [g for g in grouped_files if self.config.clustering_engine != "hdbscan" or grouped_files.index(g) != len(grouped_files) - 1 or len(unique_template_fingerprints) == 0 or np.sum(unique_template_fingerprints[-1]) != 0]
+            noise_group = grouped_files[-1] if self.config.clustering_engine == "hdbscan" and grouped_files and np.sum(unique_template_fingerprints[-1]) == 0 else []
+
+            sorted_valid_groups = sorted(valid_groups, key=len, reverse=True)
+
+            for i, files in enumerate(sorted_valid_groups):
                 print(f"📄 Template #{i + 1} ({len(files)} files):")
                 print(f"   - {files[0]} (Representative)")
                 # Print up to 5 similar files for brevity
@@ -457,6 +610,14 @@ class DocumentFingerprinter:
                     print(f"   - {file_name}")
                 if len(files) > 6:
                     print(f"   ... and {len(files) - 6} more.")
+                print("-" * 25)
+
+            if noise_group:
+                print(f"⚠️  Noise / Outliers ({len(noise_group)} files):")
+                for file_name in sorted(noise_group[:5]):
+                    print(f"   - {file_name}")
+                if len(noise_group) > 5:
+                    print(f"   ... and {len(noise_group) - 5} more.")
                 print("-" * 25)
 
     def run(self) -> None:
@@ -474,15 +635,16 @@ class DocumentFingerprinter:
         self.timings["2. OCR Processing (GPU/CPU)"] = time.monotonic() - stage_time
 
         stage_time = time.monotonic()
-        all_doc_fingerprints = self._generate_fingerprints(ocr_results, doc_page_counts)
-        self.timings["3. Fingerprint Generation"] = time.monotonic() - stage_time
+        all_doc_fingerprints, all_doc_texts = self._generate_fingerprints(ocr_results, doc_page_counts)
+        self.timings["3. Fingerprint & Text Ext."] = time.monotonic() - stage_time
 
         stage_time = time.monotonic()
-        unique_fps, grouped_files = self._group_documents(all_doc_fingerprints)
+        unique_fps, grouped_files = self._group_documents(all_doc_fingerprints, all_doc_texts)
         self.timings["4. Similarity Grouping"] = time.monotonic() - stage_time
 
         stage_time = time.monotonic()
         self._generate_visual_reports(grouped_files, unique_fps, all_doc_fingerprints)
+        self._generate_interactive_dashboard(all_doc_fingerprints, all_doc_texts, grouped_files, unique_fps)
         self.timings["5. Visual Report Generation"] = time.monotonic() - stage_time
         
         self.timings["Total Script Runtime"] = time.monotonic() - script_start_time
@@ -516,6 +678,12 @@ def main():
                         help="Gaussian blur sigma for spatial fingerprints. Higher values allow more flexibility in layout matches.")
     parser.add_argument("--profile", choices=["loss_runs", "applications", "default"], default="default",
                         help="Select a pre-configured tuning profile for specific document types. Overrides --blur and --threshold.")
+    parser.add_argument("--engine", choices=["agglomerative", "hdbscan"], default="agglomerative", dest="clustering_engine",
+                        help="Choose the clustering algorithm. 'agglomerative' uses a strict threshold. 'hdbscan' auto-finds dense clusters and isolates noise.")
+    parser.add_argument("--min_cluster_size", type=int, default=5,
+                        help="Minimum number of documents to form a cluster (only used if --engine is hdbscan).")
+    parser.add_argument("--semantic_weight", type=float, default=0.0,
+                        help="Weight (0.0 to 1.0) given to text content similarity vs spatial layout. 0.0 = purely spatial, 0.5 = 50/50 mix, 1.0 = purely semantic.")
     # The --diag action is now handled manually above, but we keep it for --help message
     parser.add_argument("--diag", action="store_true", help="Run a diagnostic check and exit.")
 
@@ -550,6 +718,9 @@ def main():
         batch_size=args.batch_size,
         dpi=args.dpi,
         blur_sigma=blur,
+        clustering_engine=args.clustering_engine,
+        min_cluster_size=args.min_cluster_size,
+        semantic_weight=args.semantic_weight,
     )
 
     # --- Execution ---
