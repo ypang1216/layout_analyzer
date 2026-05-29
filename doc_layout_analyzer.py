@@ -314,15 +314,24 @@ class DocumentFingerprinter:
         num_docs = len(valid_fps)
 
         # --- Stage 1: Fast Pre-Clustering (Deduplication) ---
-        # We hash the rounded spatial fingerprint to group identical or near-identical documents instantly.
-        # This prevents computing an N x N matrix for thousands of exact duplicates.
+        # We group highly identical documents instantly to prevent computing an N x N matrix for duplicates.
+        # To account for minor "fill-ins" shifting the words slightly, we L2-normalize the spatial footprint
+        # and aggressively round it to 1 decimal place (creating 10 broad intensity buckets).
+        # This allows templates with identical boilerplate but different names/dates to safely collapse into the same hash.
         logging.info(f"Stage 1: Pre-clustering {num_docs} documents to find unique representatives...")
         hash_to_indices = {}
-        # Rounding to 2 decimals gives a tiny tolerance for floating point errors
-        rounded_fps = np.round(valid_fps_matrix, decimals=2)
+
+        # L2 Normalize the rows so total word count differences don't break the hash
+        norms = np.linalg.norm(valid_fps_matrix, axis=1, keepdims=True)
+        # Avoid division by zero
+        norms[norms == 0] = 1.0
+        normalized_fps = valid_fps_matrix / norms
+
+        # Rounding to 1 decimal place absorbs minor fill-in noise perfectly
+        rounded_fps = np.round(normalized_fps, decimals=1)
 
         for idx in range(num_docs):
-            # Create a bytes hash of the rounded array
+            # Create a bytes hash of the normalized and rounded array
             fp_hash = rounded_fps[idx].tobytes()
             if fp_hash not in hash_to_indices:
                 hash_to_indices[fp_hash] = []
