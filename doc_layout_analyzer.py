@@ -313,31 +313,49 @@ class DocumentFingerprinter:
 
         num_docs = len(valid_fps)
 
-        # --- Stage 1: Fast Pre-Clustering (Deduplication) ---
-        # We group highly identical documents instantly to prevent computing an N x N matrix for duplicates.
-        # To account for minor "fill-ins" shifting the words slightly, we L2-normalize the spatial footprint
-        # and aggressively round it to 1 decimal place (creating 10 broad intensity buckets).
-        # This allows templates with identical boilerplate but different names/dates to safely collapse into the same hash.
-        logging.info(f"Stage 1: Pre-clustering {num_docs} documents to find unique representatives...")
-        hash_to_indices = {}
+        # --- Stage 1: Fast Pre-Clustering (Greedy Leader Algorithm) ---
+        # Instead of computing an N x N matrix, we maintain a small list of unique "Template Representatives".
+        # As we process each document, we compare it ONLY to the known representatives.
+        # If it is >= 95% similar to a representative, we assign it as a "child" of that template.
+        # This >95% threshold perfectly absorbs the 1-5% noise introduced by different people filling in forms
+        # (names, dates, check boxes) while keeping computational and memory complexity extremely low (O(N * K)).
+        logging.info(f"Stage 1: Pre-clustering {num_docs} documents to find unique representatives (absorbs fill-ins)...")
 
-        # L2 Normalize the rows so total word count differences don't break the hash
-        norms = np.linalg.norm(valid_fps_matrix, axis=1, keepdims=True)
-        # Avoid division by zero
-        norms[norms == 0] = 1.0
-        normalized_fps = valid_fps_matrix / norms
+        rep_to_children = {}  # Map: representative index -> list of child indices
+        representative_indices = []
+        representative_fps = []
 
-        # Rounding to 1 decimal place absorbs minor fill-in noise perfectly
-        rounded_fps = np.round(normalized_fps, decimals=1)
+        # We use a very strict threshold for Stage 1.
+        # Anything lower will be evaluated in Stage 2's heavy clustering.
+        greedy_threshold = 0.95
 
         for idx in range(num_docs):
-            # Create a bytes hash of the normalized and rounded array
-            fp_hash = rounded_fps[idx].tobytes()
-            if fp_hash not in hash_to_indices:
-                hash_to_indices[fp_hash] = []
-            hash_to_indices[fp_hash].append(idx)
+            current_fp = valid_fps_matrix[idx]
 
-        representative_indices = [indices[0] for indices in hash_to_indices.values()]
+            if not representative_indices:
+                # First document becomes the first representative
+                representative_indices.append(idx)
+                representative_fps.append(current_fp)
+                rep_to_children[idx] = [idx]
+                continue
+
+            # Compare current document against ALL known representatives simultaneously
+            # cosine_similarity expects 2D arrays, so we reshape current_fp
+            sim_scores = cosine_similarity(current_fp.reshape(1, -1), np.array(representative_fps))[0]
+
+            best_match_idx = np.argmax(sim_scores)
+            best_score = sim_scores[best_match_idx]
+
+            if best_score >= greedy_threshold:
+                # It's an exact or highly similar template (just filled in differently)
+                rep_idx = representative_indices[best_match_idx]
+                rep_to_children[rep_idx].append(idx)
+            else:
+                # It's a completely new template
+                representative_indices.append(idx)
+                representative_fps.append(current_fp)
+                rep_to_children[idx] = [idx]
+
         num_reps = len(representative_indices)
         logging.info(f"Pre-clustering complete: Reduced {num_docs} documents to {num_reps} unique representatives.")
 
@@ -419,11 +437,8 @@ class DocumentFingerprinter:
         for rep_enum_idx, label in enumerate(labels):
             rep_original_idx = representative_indices[rep_enum_idx]
 
-            # Find the hash of this representative
-            fp_hash = rounded_fps[rep_original_idx].tobytes()
-
-            # Get all child document indices that match this hash
-            child_indices = hash_to_indices[fp_hash]
+            # Get all child document indices that belong to this representative
+            child_indices = rep_to_children[rep_original_idx]
 
             for child_idx in child_indices:
                 global_pdf_idx = valid_indices[child_idx]
