@@ -312,24 +312,47 @@ class DocumentFingerprinter:
             return [valid_fps[0]], [[os.path.basename(self.pdf_files[valid_indices[0]])]]
 
         num_docs = len(valid_fps)
-        if num_docs > 10000:
-            logging.warning(f"Processing {num_docs} documents. Optimizing memory usage with float32 and in-place operations to prevent OOM errors.")
 
-        # 1. Compute SPATIAL distance matrix (in-place memory optimization)
-        # We reuse the similarity matrix memory to store the distance matrix
-        distance_matrix = cosine_similarity(valid_fps_matrix)
+        # --- Stage 1: Fast Pre-Clustering (Deduplication) ---
+        # We hash the rounded spatial fingerprint to group identical or near-identical documents instantly.
+        # This prevents computing an N x N matrix for thousands of exact duplicates.
+        logging.info(f"Stage 1: Pre-clustering {num_docs} documents to find unique representatives...")
+        hash_to_indices = {}
+        # Rounding to 2 decimals gives a tiny tolerance for floating point errors
+        rounded_fps = np.round(valid_fps_matrix, decimals=2)
+
+        for idx in range(num_docs):
+            # Create a bytes hash of the rounded array
+            fp_hash = rounded_fps[idx].tobytes()
+            if fp_hash not in hash_to_indices:
+                hash_to_indices[fp_hash] = []
+            hash_to_indices[fp_hash].append(idx)
+
+        representative_indices = [indices[0] for indices in hash_to_indices.values()]
+        num_reps = len(representative_indices)
+        logging.info(f"Pre-clustering complete: Reduced {num_docs} documents to {num_reps} unique representatives.")
+
+        if num_reps > 10000:
+            logging.warning(f"Processing {num_reps} unique representatives. Computing N x N dense matrices may consume significant memory.")
+
+        # Extract only the representatives for the heavy N x N math
+        rep_fps_matrix = valid_fps_matrix[representative_indices]
+        rep_texts = [valid_texts[i] for i in representative_indices]
+
+        # --- Stage 2: Heavy Semantic/Spatial Clustering ---
+        # 1. Compute SPATIAL distance matrix for representatives (in-place memory optimization)
+        distance_matrix = cosine_similarity(rep_fps_matrix)
         # Convert similarity (1.0) to distance (0.0) in place
         np.subtract(1.0, distance_matrix, out=distance_matrix)
         np.clip(distance_matrix, 0.0, 2.0, out=distance_matrix)
 
-        # 2. Compute SEMANTIC distance matrix (if requested)
+        # 2. Compute SEMANTIC distance matrix for representatives (if requested)
         if self.config.semantic_weight > 0.0:
             logging.info(f"Computing semantic distances (weight: {self.config.semantic_weight})")
             try:
                 # min_df ignores unique fill-ins, ngram_range captures boilerplate phrases
                 vectorizer = TfidfVectorizer(min_df=0.05, max_df=1.0, ngram_range=(1, 3))
-                # Cast the tfidf outputs to float32 explicitly if possible by casting vectorizer output
-                tfidf_matrix = vectorizer.fit_transform(valid_texts).astype(np.float32)
+                tfidf_matrix = vectorizer.fit_transform(rep_texts).astype(np.float32)
 
                 # Compute semantic distance in a new array, but do it in-place
                 semantic_distance = cosine_similarity(tfidf_matrix)
@@ -381,20 +404,32 @@ class DocumentFingerprinter:
         grouped_files = [[] for _ in range(num_clusters)]
         noise_files = []
 
-        for idx, label in enumerate(labels):
-            original_i = valid_indices[idx]
-            pdf_name = os.path.basename(self.pdf_files[original_i])
+        # --- Stage 3: Map all children back to their final cluster IDs ---
+        # `labels` only contains the cluster IDs for the `num_reps` representatives.
+        # We need to map every original document back to the cluster of its representative.
+        for rep_enum_idx, label in enumerate(labels):
+            rep_original_idx = representative_indices[rep_enum_idx]
 
-            if label == -1:
-                noise_files.append(pdf_name)
-            else:
-                grouped_files[label].append(pdf_name)
+            # Find the hash of this representative
+            fp_hash = rounded_fps[rep_original_idx].tobytes()
 
-        # Calculate representative fingerprints for each valid cluster (e.g. mean)
+            # Get all child document indices that match this hash
+            child_indices = hash_to_indices[fp_hash]
+
+            for child_idx in child_indices:
+                global_pdf_idx = valid_indices[child_idx]
+                pdf_name = os.path.basename(self.pdf_files[global_pdf_idx])
+
+                if label == -1:
+                    noise_files.append(pdf_name)
+                else:
+                    grouped_files[label].append(pdf_name)
+
+        # Calculate representative fingerprints for each valid cluster (e.g. mean of the representatives)
         for label in range(num_clusters):
-            # Get indices of valid_fps that belong to this cluster
-            cluster_indices = np.where(labels == label)[0]
-            cluster_fps = valid_fps_matrix[cluster_indices]
+            # Get indices of the representatives that belong to this cluster
+            cluster_rep_indices = np.where(labels == label)[0]
+            cluster_fps = rep_fps_matrix[cluster_rep_indices]
             representative_fp = np.mean(cluster_fps, axis=0)
             unique_template_fingerprints.append(representative_fp)
 
