@@ -303,39 +303,102 @@ class DocumentFingerprinter:
         if not valid_fps:
             return [], []
 
-        valid_fps_matrix = np.array(valid_fps)
+        import gc
+        # Convert to float32 to save memory (cuts memory usage in half for distance matrices)
+        valid_fps_matrix = np.array(valid_fps, dtype=np.float32)
 
         # If there's only 1 valid document, just return it as a single group
         if len(valid_fps) == 1:
             return [valid_fps[0]], [[os.path.basename(self.pdf_files[valid_indices[0]])]]
 
         num_docs = len(valid_fps)
-        if num_docs > 10000:
-            logging.warning(f"Processing {num_docs} documents. Computing N x N dense matrices may consume significant memory and could cause Out Of Memory (OOM) errors.")
 
-        # 1. Compute SPATIAL distance matrix
-        spatial_similarity_matrix = cosine_similarity(valid_fps_matrix)
-        spatial_distance_matrix = np.clip(1.0 - spatial_similarity_matrix, 0.0, 2.0)
+        # --- Stage 1: Fast Pre-Clustering (Greedy Leader Algorithm) ---
+        # Instead of computing an N x N matrix, we maintain a small list of unique "Template Representatives".
+        # As we process each document, we compare it ONLY to the known representatives.
+        # If it is >= 95% similar to a representative, we assign it as a "child" of that template.
+        # This >95% threshold perfectly absorbs the 1-5% noise introduced by different people filling in forms
+        # (names, dates, check boxes) while keeping computational and memory complexity extremely low (O(N * K)).
+        logging.info(f"Stage 1: Pre-clustering {num_docs} documents to find unique representatives (absorbs fill-ins)...")
 
-        # 2. Compute SEMANTIC distance matrix (if requested)
+        rep_to_children = {}  # Map: representative index -> list of child indices
+        representative_indices = []
+        representative_fps = []
+
+        # We use a very strict threshold for Stage 1.
+        # Anything lower will be evaluated in Stage 2's heavy clustering.
+        greedy_threshold = 0.95
+
+        for idx in range(num_docs):
+            current_fp = valid_fps_matrix[idx]
+
+            if not representative_indices:
+                # First document becomes the first representative
+                representative_indices.append(idx)
+                representative_fps.append(current_fp)
+                rep_to_children[idx] = [idx]
+                continue
+
+            # Compare current document against ALL known representatives simultaneously
+            # cosine_similarity expects 2D arrays, so we reshape current_fp
+            sim_scores = cosine_similarity(current_fp.reshape(1, -1), np.array(representative_fps))[0]
+
+            best_match_idx = np.argmax(sim_scores)
+            best_score = sim_scores[best_match_idx]
+
+            if best_score >= greedy_threshold:
+                # It's an exact or highly similar template (just filled in differently)
+                rep_idx = representative_indices[best_match_idx]
+                rep_to_children[rep_idx].append(idx)
+            else:
+                # It's a completely new template
+                representative_indices.append(idx)
+                representative_fps.append(current_fp)
+                rep_to_children[idx] = [idx]
+
+        num_reps = len(representative_indices)
+        logging.info(f"Pre-clustering complete: Reduced {num_docs} documents to {num_reps} unique representatives.")
+
+        if num_reps > 10000:
+            logging.warning(f"Processing {num_reps} unique representatives. Computing N x N dense matrices may consume significant memory.")
+
+        # Extract only the representatives for the heavy N x N math
+        rep_fps_matrix = valid_fps_matrix[representative_indices]
+        rep_texts = [valid_texts[i] for i in representative_indices]
+
+        # --- Stage 2: Heavy Semantic/Spatial Clustering ---
+        # 1. Compute SPATIAL distance matrix for representatives (in-place memory optimization)
+        distance_matrix = cosine_similarity(rep_fps_matrix)
+        # Convert similarity (1.0) to distance (0.0) in place
+        np.subtract(1.0, distance_matrix, out=distance_matrix)
+        np.clip(distance_matrix, 0.0, 2.0, out=distance_matrix)
+
+        # 2. Compute SEMANTIC distance matrix for representatives (if requested)
         if self.config.semantic_weight > 0.0:
             logging.info(f"Computing semantic distances (weight: {self.config.semantic_weight})")
             try:
                 # min_df ignores unique fill-ins, ngram_range captures boilerplate phrases
                 vectorizer = TfidfVectorizer(min_df=0.05, max_df=1.0, ngram_range=(1, 3))
-                tfidf_matrix = vectorizer.fit_transform(valid_texts)
-                semantic_similarity_matrix = cosine_similarity(tfidf_matrix)
-                semantic_distance_matrix = np.clip(1.0 - semantic_similarity_matrix, 0.0, 2.0)
+                tfidf_matrix = vectorizer.fit_transform(rep_texts).astype(np.float32)
 
-                # Combine matrices via weighted average
+                # Compute semantic distance in a new array, but do it in-place
+                semantic_distance = cosine_similarity(tfidf_matrix)
+                np.subtract(1.0, semantic_distance, out=semantic_distance)
+                np.clip(semantic_distance, 0.0, 2.0, out=semantic_distance)
+
+                # Combine matrices via weighted average in-place onto distance_matrix
                 spatial_weight = 1.0 - self.config.semantic_weight
-                distance_matrix = (spatial_weight * spatial_distance_matrix) + (self.config.semantic_weight * semantic_distance_matrix)
+                np.multiply(distance_matrix, spatial_weight, out=distance_matrix)
+                np.multiply(semantic_distance, self.config.semantic_weight, out=semantic_distance)
+                np.add(distance_matrix, semantic_distance, out=distance_matrix)
+
+                # Free memory explicitly
+                del semantic_distance
+                del tfidf_matrix
+                gc.collect()
             except ValueError as e:
                 # E.g., if vocabulary is empty because all words were filtered out
                 logging.warning(f"Semantic processing failed, falling back to spatial only. Reason: {e}")
-                distance_matrix = spatial_distance_matrix
-        else:
-            distance_matrix = spatial_distance_matrix
 
         if self.config.clustering_engine == "agglomerative":
             logging.info("Using Agglomerative Clustering engine.")
@@ -368,20 +431,29 @@ class DocumentFingerprinter:
         grouped_files = [[] for _ in range(num_clusters)]
         noise_files = []
 
-        for idx, label in enumerate(labels):
-            original_i = valid_indices[idx]
-            pdf_name = os.path.basename(self.pdf_files[original_i])
+        # --- Stage 3: Map all children back to their final cluster IDs ---
+        # `labels` only contains the cluster IDs for the `num_reps` representatives.
+        # We need to map every original document back to the cluster of its representative.
+        for rep_enum_idx, label in enumerate(labels):
+            rep_original_idx = representative_indices[rep_enum_idx]
 
-            if label == -1:
-                noise_files.append(pdf_name)
-            else:
-                grouped_files[label].append(pdf_name)
+            # Get all child document indices that belong to this representative
+            child_indices = rep_to_children[rep_original_idx]
 
-        # Calculate representative fingerprints for each valid cluster (e.g. mean)
+            for child_idx in child_indices:
+                global_pdf_idx = valid_indices[child_idx]
+                pdf_name = os.path.basename(self.pdf_files[global_pdf_idx])
+
+                if label == -1:
+                    noise_files.append(pdf_name)
+                else:
+                    grouped_files[label].append(pdf_name)
+
+        # Calculate representative fingerprints for each valid cluster (e.g. mean of the representatives)
         for label in range(num_clusters):
-            # Get indices of valid_fps that belong to this cluster
-            cluster_indices = np.where(labels == label)[0]
-            cluster_fps = valid_fps_matrix[cluster_indices]
+            # Get indices of the representatives that belong to this cluster
+            cluster_rep_indices = np.where(labels == label)[0]
+            cluster_fps = rep_fps_matrix[cluster_rep_indices]
             representative_fp = np.mean(cluster_fps, axis=0)
             unique_template_fingerprints.append(representative_fp)
 
