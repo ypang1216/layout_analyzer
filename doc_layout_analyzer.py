@@ -303,7 +303,9 @@ class DocumentFingerprinter:
         if not valid_fps:
             return [], []
 
-        valid_fps_matrix = np.array(valid_fps)
+        import gc
+        # Convert to float32 to save memory (cuts memory usage in half for distance matrices)
+        valid_fps_matrix = np.array(valid_fps, dtype=np.float32)
 
         # If there's only 1 valid document, just return it as a single group
         if len(valid_fps) == 1:
@@ -311,11 +313,14 @@ class DocumentFingerprinter:
 
         num_docs = len(valid_fps)
         if num_docs > 10000:
-            logging.warning(f"Processing {num_docs} documents. Computing N x N dense matrices may consume significant memory and could cause Out Of Memory (OOM) errors.")
+            logging.warning(f"Processing {num_docs} documents. Optimizing memory usage with float32 and in-place operations to prevent OOM errors.")
 
-        # 1. Compute SPATIAL distance matrix
-        spatial_similarity_matrix = cosine_similarity(valid_fps_matrix)
-        spatial_distance_matrix = np.clip(1.0 - spatial_similarity_matrix, 0.0, 2.0)
+        # 1. Compute SPATIAL distance matrix (in-place memory optimization)
+        # We reuse the similarity matrix memory to store the distance matrix
+        distance_matrix = cosine_similarity(valid_fps_matrix)
+        # Convert similarity (1.0) to distance (0.0) in place
+        np.subtract(1.0, distance_matrix, out=distance_matrix)
+        np.clip(distance_matrix, 0.0, 2.0, out=distance_matrix)
 
         # 2. Compute SEMANTIC distance matrix (if requested)
         if self.config.semantic_weight > 0.0:
@@ -323,19 +328,27 @@ class DocumentFingerprinter:
             try:
                 # min_df ignores unique fill-ins, ngram_range captures boilerplate phrases
                 vectorizer = TfidfVectorizer(min_df=0.05, max_df=1.0, ngram_range=(1, 3))
-                tfidf_matrix = vectorizer.fit_transform(valid_texts)
-                semantic_similarity_matrix = cosine_similarity(tfidf_matrix)
-                semantic_distance_matrix = np.clip(1.0 - semantic_similarity_matrix, 0.0, 2.0)
+                # Cast the tfidf outputs to float32 explicitly if possible by casting vectorizer output
+                tfidf_matrix = vectorizer.fit_transform(valid_texts).astype(np.float32)
 
-                # Combine matrices via weighted average
+                # Compute semantic distance in a new array, but do it in-place
+                semantic_distance = cosine_similarity(tfidf_matrix)
+                np.subtract(1.0, semantic_distance, out=semantic_distance)
+                np.clip(semantic_distance, 0.0, 2.0, out=semantic_distance)
+
+                # Combine matrices via weighted average in-place onto distance_matrix
                 spatial_weight = 1.0 - self.config.semantic_weight
-                distance_matrix = (spatial_weight * spatial_distance_matrix) + (self.config.semantic_weight * semantic_distance_matrix)
+                np.multiply(distance_matrix, spatial_weight, out=distance_matrix)
+                np.multiply(semantic_distance, self.config.semantic_weight, out=semantic_distance)
+                np.add(distance_matrix, semantic_distance, out=distance_matrix)
+
+                # Free memory explicitly
+                del semantic_distance
+                del tfidf_matrix
+                gc.collect()
             except ValueError as e:
                 # E.g., if vocabulary is empty because all words were filtered out
                 logging.warning(f"Semantic processing failed, falling back to spatial only. Reason: {e}")
-                distance_matrix = spatial_distance_matrix
-        else:
-            distance_matrix = spatial_distance_matrix
 
         if self.config.clustering_engine == "agglomerative":
             logging.info("Using Agglomerative Clustering engine.")
